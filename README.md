@@ -181,6 +181,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 *   The [WayDroid](https://waydro.id/) project.
 *   All contributors to the upstream projects like OpenGApps, MicroG, and Magisk.
 
+[Donate link – PayPal](https://www.paypal.me/WaelIsa)
+
+
 ---
 
 **Made with ❤️ for the WayDroid community**
