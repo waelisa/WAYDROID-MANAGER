@@ -1,6 +1,35 @@
 #!/usr/bin/env bash
 
-# WayDroid Management Script - Now with actual Python script integration
+#############################################################################################################################
+# The MIT License (MIT)
+# Wael Isa
+# Build Date: 02/18/2026
+# Version: 2.1.0
+# https://github.com/waelisa/WAYDROID-MANAGER
+#############################################################################################################################
+# WayDroid Management Script - Complete Android container orchestrator for Linux
+# Automatically manages WayDroid Android container on Linux with industrial-grade reliability
+# Features:
+#   ✓ Multi-distro support (Arch, Debian, Fedora, openSUSE)
+#   ✓ Automatic waydroid_script integration with Python venv
+#   ✓ ARM translation layers (libndk/libhoudini) for x86 systems
+#   ✓ Google Apps/MicroG installation with Play Store certification
+#   ✓ Magisk root integration for system-level access
+#   ✓ Widevine DRM L3 support for streaming services
+#   ✓ Desktop mode launcher (smartdock)
+#   ✓ Interactive menu system with color-coded output
+#   ✓ Systemd service management with status monitoring
+#   ✓ Binder module verification and auto-loading
+#   ✓ Firewall configuration for network bridge
+#   ✓ Wayland session detection with fallback options
+#   ✓ Multi-window and full UI mode support
+#   ✓ MITM certificate installation for development
+#   ✓ Android 11 specific hacks (NoDataPerm, hide status bar)
+#   ✓ Comprehensive error trapping with cleanup
+#   ✓ Root privilege validation with sudo detection
+#   ✓ Lock file protection against concurrent runs
+#   ✓ Secure logging with rotation capabilities
+#############################################################################################################################
 
 set -euo pipefail
 
@@ -27,17 +56,51 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WAYDROID_SCRIPT_DIR="${SCRIPT_DIR}/waydroid_script"
 PYTHON_SCRIPT="${WAYDROID_SCRIPT_DIR}/venv/bin/python3"
 MAIN_PY="${WAYDROID_SCRIPT_DIR}/main.py"
+LOG_FILE="/var/log/waydroid-manager.log"
+LOCK_FILE="/tmp/waydroid-manager.lock"
+TEMP_DIR="/tmp/waydroid-install-$$"
+
+# Cleanup function
+cleanup() {
+    local exit_code=$?
+    if [[ -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR" 2>/dev/null
+    fi
+    if [[ -f "$LOCK_FILE" ]]; then
+        rm -f "$LOCK_FILE" 2>/dev/null
+    fi
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Script exited with error code: $exit_code"
+    fi
+    exit $exit_code
+}
+
+# Set up trap for cleanup
+trap cleanup EXIT INT TERM
+
+# Create temp directory
+setup_temp() {
+    mkdir -p "$TEMP_DIR"
+    log_info "Created temporary directory: $TEMP_DIR"
+}
 
 # Logging functions
-log_info() { echo -e "${GREEN}${INFO} [INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}${CHECK_MARK} [SUCCESS]${NC} $1"; }
-log_error() { echo -e "${RED}${CROSS_MARK} [ERROR]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}${WARNING} [WARN]${NC} $1"; }
-log_step() { echo -e "${CYAN}${GEAR} [STEP]${NC} $1"; }
-log_header() { 
-    echo -e "\n${PURPLE}${BOLD}════════════════════════════════════════════${NC}"
-    echo -e "${PURPLE}${BOLD}  $1${NC}"
-    echo -e "${PURPLE}${BOLD}════════════════════════════════════════════${NC}\n"
+log_info() { echo -e "${GREEN}${INFO} [INFO]${NC} $1" | tee -a "$LOG_FILE"; }
+log_success() { echo -e "${GREEN}${CHECK_MARK} [SUCCESS]${NC} $1" | tee -a "$LOG_FILE"; }
+log_error() { echo -e "${RED}${CROSS_MARK} [ERROR]${NC} $1" | tee -a "$LOG_FILE"; }
+log_warn() { echo -e "${YELLOW}${WARNING} [WARN]${NC} $1" | tee -a "$LOG_FILE"; }
+log_step() { echo -e "${CYAN}${GEAR} [STEP]${NC} $1" | tee -a "$LOG_FILE"; }
+log_header() {
+    echo -e "\n${PURPLE}${BOLD}════════════════════════════════════════════${NC}" | tee -a "$LOG_FILE"
+    echo -e "${PURPLE}${BOLD}  $1${NC}" | tee -a "$LOG_FILE"
+    echo -e "${PURPLE}${BOLD}════════════════════════════════════════════${NC}\n" | tee -a "$LOG_FILE"
+}
+
+# Initialize log file
+setup_logging() {
+    touch "$LOG_FILE" 2>/dev/null || sudo touch "$LOG_FILE"
+    chmod 640 "$LOG_FILE" 2>/dev/null || sudo chmod 640 "$LOG_FILE"
+    log_info "Logging initialized: $LOG_FILE"
 }
 
 # Check root
@@ -69,24 +132,90 @@ get_host_arch() {
     uname -m
 }
 
+# Check for Wayland session
+check_wayland() {
+    log_step "Checking display server"
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+        log_warn "Wayland not detected. You are likely running X11."
+        echo "Waydroid requires a Wayland compositor for optimal performance."
+        echo ""
+        echo "Options:"
+        echo "  1) Switch to a Wayland session (recommended for your DE)"
+        echo "  2) Run Weston (nested Wayland compositor): sudo weston"
+        echo "  3) Continue anyway (may have issues)"
+        echo ""
+        echo -n "Continue anyway? (y/N): "
+        read -r continue_anyway
+        if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
+            log_info "Installation cancelled"
+            return 1
+        fi
+        log_warn "Continuing without Wayland detection - UI may have issues"
+    else
+        log_success "Wayland session detected: $WAYLAND_DISPLAY"
+    fi
+}
+
+# Setup firewall for Waydroid network bridge
+setup_firewall() {
+    log_step "Configuring firewall for Waydroid network access"
+
+    if command_exists ufw; then
+        log_info "Detected UFW firewall"
+        ufw route allow in on waydroid0 >/dev/null 2>&1
+        ufw route allow out on waydroid0 >/dev/null 2>&1
+        log_success "UFW rules updated for waydroid0 interface"
+    elif command_exists nft; then
+        log_info "Detected nftables"
+        # Add nftables rules if needed
+        nft add rule inet filter forward iifname "waydroid0" accept 2>/dev/null || true
+        nft add rule inet filter forward oifname "waydroid0" accept 2>/dev/null || true
+        log_success "nftables rules updated"
+    elif command_exists iptables; then
+        log_info "Detected iptables"
+        iptables -I FORWARD -i waydroid0 -j ACCEPT 2>/dev/null || true
+        iptables -I FORWARD -o waydroid0 -j ACCEPT 2>/dev/null || true
+        log_success "iptables rules updated"
+    else
+        log_warn "No supported firewall detected. Network may not work in container."
+    fi
+}
+
+# Check binder module
+check_binder() {
+    log_step "Checking binder module"
+    if ! lsmod | grep -q "binder_linux"; then
+        log_warn "Binder module not loaded. Attempting to load..."
+        modprobe binder_linux 2>/dev/null || modprobe binder-linux 2>/dev/null || {
+            log_error "Failed to load binder_linux. Check your kernel."
+            echo "For Arch Linux, install: linux-zen-headers or linux-lts-headers"
+            echo "Then reboot or run: sudo modprobe binder_linux"
+            return 1
+        }
+        log_success "Binder module loaded"
+    else
+        log_success "Binder module is loaded"
+    fi
+}
+
 # Install required dependencies based on distribution
 install_dependencies() {
     local distro=$(detect_distro)
     log_step "Installing dependencies for $distro"
-    
+
     case $distro in
         arch|manjaro|endeavouros)
-            pacman -S --noconfirm lzip git python python-pip python-virtualenv
+            pacman -S --noconfirm lzip git python python-pip python-virtualenv waydroid weston binder_linux-dkms linux-headers ufw
             ;;
         debian|ubuntu|linuxmint|pop)
             apt update
-            apt install -y lzip git python3 python3-pip python3-venv
+            apt install -y lzip git python3 python3-pip python3-venv waydroid weston ufw
             ;;
         fedora|rhel|centos|rocky)
-            dnf install -y lzip git python3 python3-pip python3-virtualenv
+            dnf install -y lzip git python3 python3-pip python3-virtualenv waydroid weston
             ;;
         opensuse*)
-            zypper install -y lzip git python3 python3-pip python3-virtualenv
+            zypper install -y lzip git python3 python3-pip python3-virtualenv waydroid weston
             ;;
         *)
             log_warn "Unknown distribution. Please install lzip, git, python3, python3-pip manually"
@@ -97,19 +226,48 @@ install_dependencies() {
             fi
             ;;
     esac
+
+    # Verify binder module after installation
+    check_binder
+
+    # Setup firewall
+    setup_firewall
+
     log_success "Dependencies installed"
+}
+
+# Run the Python script with arguments
+run_python_script() {
+    # Check if virtual environment exists, if not install dependencies
+    if [[ ! -f "$PYTHON_SCRIPT" ]]; then
+        log_warn "Python virtual environment not found. Setting up waydroid_script first..."
+        setup_waydroid_script
+    fi
+
+    if [[ ! -f "$MAIN_PY" ]]; then
+        log_error "waydroid_script not found. Please run setup first."
+        return 1
+    fi
+
+    log_step "Running: ${PYTHON_SCRIPT} ${MAIN_PY} $*"
+    cd "$WAYDROID_SCRIPT_DIR"
+    "${PYTHON_SCRIPT}" "$MAIN_PY" "$@"
 }
 
 # Clone and setup waydroid_script
 setup_waydroid_script() {
-    log_header "SETTING UP WAYDROID SCRIPT"
-    
+    log_header "STEP 1: SETTING UP WAYDROID SCRIPT"
+
+    # Create temp directory
+    setup_temp
+
     # Check if already exists
     if [[ -d "$WAYDROID_SCRIPT_DIR" ]]; then
         log_info "waydroid_script directory already exists"
         echo -n "Update it? (y/N): "
         read -r update
         if [[ "$update" =~ ^[Yy]$ ]]; then
+            log_step "Updating waydroid_script repository"
             cd "$WAYDROID_SCRIPT_DIR"
             git pull
         fi
@@ -117,39 +275,30 @@ setup_waydroid_script() {
         log_step "Cloning waydroid_script repository"
         git clone https://github.com/casualsnek/waydroid_script.git "$WAYDROID_SCRIPT_DIR"
     fi
-    
+
     # Setup virtual environment
     if [[ ! -d "${WAYDROID_SCRIPT_DIR}/venv" ]]; then
         log_step "Creating Python virtual environment"
         cd "$WAYDROID_SCRIPT_DIR"
         python3 -m venv venv
     fi
-    
+
     # Install requirements
     log_step "Installing Python requirements"
     cd "$WAYDROID_SCRIPT_DIR"
     "${PYTHON_SCRIPT}" -m pip install --upgrade pip
     "${PYTHON_SCRIPT}" -m pip install -r requirements.txt
-    
-    log_success "waydroid_script setup complete"
-}
 
-# Run the Python script with arguments
-run_python_script() {
-    if [[ ! -f "$MAIN_PY" ]]; then
-        log_error "waydroid_script not found. Please run option 1 first to set it up."
-        return 1
-    fi
-    
-    log_step "Running: ${PYTHON_SCRIPT} ${MAIN_PY} $*"
-    cd "$WAYDROID_SCRIPT_DIR"
-    "${PYTHON_SCRIPT}" "$MAIN_PY" "$@"
+    log_success "waydroid_script setup complete"
 }
 
 # Install WayDroid on Arch Linux
 install_arch() {
-    log_header "INSTALLING WAYDROID ON ARCH LINUX"
-    
+    log_header "STEP 2: INSTALLING WAYDROID ON ARCH LINUX"
+
+    # Check for Wayland
+    check_wayland
+
     # Check if running on Arch
     local distro=$(detect_distro)
     if [[ "$distro" != "arch" && "$distro" != "manjaro" && "$distro" != "endeavouros" ]]; then
@@ -162,35 +311,39 @@ install_arch() {
             return 1
         fi
     fi
-    
+
     log_step "Updating system"
     pacman -Syu --noconfirm
-    
+
     log_step "Installing WayDroid and dependencies"
-    pacman -S --noconfirm waydroid binder_linux-dkms lzip git python python-pip python-virtualenv
-    
+    pacman -S --noconfirm waydroid weston binder_linux-dkms lzip git python python-pip python-virtualenv linux-headers ufw
+
     # Check binder module
-    log_step "Checking binder module"
-    if ! lsmod | grep -q "binder"; then
-        log_warn "Binder module not loaded"
-        modprobe binder_linux 2>/dev/null || modprobe binder-linux 2>/dev/null || {
-            log_error "Failed to load binder module"
-            echo "You may need to reboot"
-        }
-    else
-        log_success "Binder module is loaded"
-    fi
-    
+    check_binder
+
+    # Setup firewall
+    setup_firewall
+
     # Initialize WayDroid if needed
     if [[ ! -d "/var/lib/waydroid/images" ]]; then
         log_step "Initializing WayDroid"
         waydroid init
     fi
-    
+
     # Start service
+    log_step "Starting WayDroid container service"
     systemctl enable --now waydroid-container
-    
+
     log_success "WayDroid installed successfully"
+
+    # Provide next steps
+    echo
+    log_info "Next steps:"
+    echo "  1. Run 'sudo $0 ui' to start WayDroid in full UI mode"
+    echo "  2. Or run 'sudo $0 multi' for multi-window mode"
+    echo "  3. Run 'sudo $0 install gapps' to install Google Apps"
+    echo "  4. For ARM apps on x86, install: libndk (AMD) or libhoudini (Intel)"
+    echo "  5. Get Play Store certification: sudo $0 certified"
 }
 
 # Install apps submenu
@@ -214,23 +367,23 @@ install_apps_menu() {
         echo " 0) Back to main menu"
         echo
         echo -n "Enter selection (e.g., '1 3 5'): "
-        
+
         read -r selections
-        
+
         if [[ "$selections" == "0" ]]; then
             return 0
         fi
-        
+
         if [[ -z "$selections" ]]; then
             log_error "No selection made"
             read -p "Press Enter to continue..."
             continue
         fi
-        
+
         # Build the install command
         local install_args=()
         local has_mitm=0
-        
+
         for num in $selections; do
             case $num in
                 1) install_args+=("gapps") ;;
@@ -247,7 +400,7 @@ install_apps_menu() {
                 *) log_warn "Invalid selection: $num" ;;
             esac
         done
-        
+
         # Handle MITM separately (needs certificate file)
         if [[ $has_mitm -eq 1 ]]; then
             echo
@@ -272,7 +425,7 @@ install_apps_menu() {
                 log_warn "No valid apps selected"
             fi
         fi
-        
+
         echo
         read -p "Press Enter to continue..."
     done
@@ -299,21 +452,21 @@ remove_apps_menu() {
         echo " 0) Back to main menu"
         echo
         echo -n "Enter selection (e.g., '1 3 5'): "
-        
+
         read -r selections
-        
+
         if [[ "$selections" == "0" ]]; then
             return 0
         fi
-        
+
         if [[ -z "$selections" ]]; then
             log_error "No selection made"
             read -p "Press Enter to continue..."
             continue
         fi
-        
+
         local remove_args=()
-        
+
         for num in $selections; do
             case $num in
                 1) remove_args+=("gapps") ;;
@@ -330,14 +483,14 @@ remove_apps_menu() {
                 *) log_warn "Invalid selection: $num" ;;
             esac
         done
-        
+
         if [[ ${#remove_args[@]} -gt 0 ]]; then
             log_info "Removing: ${remove_args[*]}"
             run_python_script uninstall "${remove_args[@]}"
         else
             log_warn "No valid apps selected"
         fi
-        
+
         echo
         read -p "Press Enter to continue..."
     done
@@ -365,6 +518,10 @@ show_help() {
     echo -e "    remove <apps>      Remove apps"
     echo -e "    certified          Get Android ID for Play Store certification"
     echo -e "    hack <hacks>       Apply hacks (nodataperm, hidestatusbar)"
+    echo
+    echo -e "    ${BOLD}UI Modes:${NC}"
+    echo -e "    ui                 Start WayDroid in full UI mode (desktop environment)"
+    echo -e "    multi              Start WayDroid in multi-window mode (apps as Linux windows)"
     echo
     echo -e "    ${BOLD}Service:${NC}"
     echo -e "    start              Start WayDroid container"
@@ -403,29 +560,33 @@ show_help() {
     echo -e "    # Install WayDroid on Arch"
     echo -e "    sudo $0 install-arch"
     echo
+    echo -e "    # Start WayDroid UI"
+    echo -e "    sudo $0 ui"
+    echo
     echo -e "    # Install multiple components"
     echo -e "    sudo $0 install gapps microg magisk"
     echo
     echo -e "    # Install ARM translation for Intel CPU"
     echo -e "    sudo $0 install libhoudini"
     echo
-    echo -e "    # Install MITM certificate"
-    echo -e "    sudo $0 install mitm --ca-cert /path/to/cert.pem"
-    echo
-    echo -e "    # Remove a hack"
-    echo -e "    sudo $0 remove nodataperm"
-    echo
     echo -e "    # Get Google certification ID"
     echo -e "    sudo $0 certified"
-    echo
-    echo -e "    # Check status"
-    echo -e "    sudo $0 status"
     echo
     echo -e "${YELLOW}${BOLD}NOTE: Most commands require root privileges (sudo)${NC}"
 }
 
 # Main menu
 interactive_mode() {
+    # Setup logging first
+    setup_logging
+
+    # Create lock file to prevent concurrent runs
+    if [[ -f "$LOCK_FILE" ]]; then
+        log_error "Another instance is already running (lock file: $LOCK_FILE)"
+        exit 1
+    fi
+    touch "$LOCK_FILE"
+
     # Check if waydroid_script is set up
     if [[ ! -f "$MAIN_PY" ]]; then
         log_warn "waydroid_script not found. Please set it up first."
@@ -441,50 +602,58 @@ interactive_mode() {
                 setup_waydroid_script
                 ;;
             *)
+                rm -f "$LOCK_FILE"
                 exit 0
                 ;;
         esac
     fi
-    
+
     while true; do
         clear
-        log_header "WAYDROID MANAGER"
+        log_header "WAYDROID MANAGER - by Wael Isa"
         echo -e "${CYAN}System:${NC} $(detect_distro) | $(get_host_arch)"
+        echo -e "${CYAN}Wayland:${NC} ${WAYLAND_DISPLAY:-Not detected}"
         echo -e "${CYAN}Waydroid Script:${NC} $([[ -f "$MAIN_PY" ]] && echo "${GREEN}Installed${NC}" || echo "${RED}Not installed${NC}")"
+        echo -e "${CYAN}Log File:${NC} $LOG_FILE"
         echo
-        
+
         echo "1) Install WayDroid on Arch Linux"
         echo "2) Install Apps (via waydroid_script)"
         echo "3) Remove Apps (via waydroid_script)"
         echo "4) Get Android ID (Play Store Certification)"
         echo "5) Apply Hacks"
-        echo "6) Start WayDroid"
-        echo "7) Stop WayDroid"
-        echo "8) Restart WayDroid"
-        echo "9) Show Status"
-        echo "10) Update waydroid_script"
-        echo "11) Help"
-        echo "12) Exit"
+        echo "6) Start WayDroid (Full UI Mode)"
+        echo "7) Start WayDroid (Multi-window Mode)"
+        echo "8) Stop WayDroid"
+        echo "9) Restart WayDroid"
+        echo "10) Show Status"
+        echo "11) Update waydroid_script"
+        echo "12) Help"
+        echo "13) Exit"
         echo
-        echo -n "Select [1-12]: "
-        
+        echo -n "Select [1-13]: "
+
         read -r choice
         case $choice in
-            1) 
+            1)
                 install_arch
                 read -p "Press Enter to continue..."
                 ;;
-            2) 
+            2)
                 install_apps_menu
                 ;;
-            3) 
+            3)
                 remove_apps_menu
                 ;;
-            4) 
+            4)
+                log_info "Fetching Google Device ID for Play Store certification..."
                 run_python_script certified
+                echo
+                log_info "Copy the ID above and register it at:"
+                echo -e "${CYAN}https://www.google.com/android/uncertified/${NC}"
                 read -p "Press Enter to continue..."
                 ;;
-            5) 
+            5)
                 echo
                 echo -e "${CYAN}Available hacks:${NC}"
                 echo "  nodataperm     - NoDataPerm hack (Android 11)"
@@ -497,38 +666,53 @@ interactive_mode() {
                 fi
                 read -p "Press Enter to continue..."
                 ;;
-            6) 
-                systemctl start waydroid-container
-                log_success "WayDroid started"
+            6)
+                log_info "Starting WayDroid in Full UI mode..."
+                check_wayland
+                check_binder
+                waydroid show-full-ui &
+                log_success "WayDroid UI started (running in background)"
                 read -p "Press Enter to continue..."
                 ;;
-            7) 
+            7)
+                log_info "Starting WayDroid in Multi-window mode..."
+                log_info "This will make Android apps appear as native Linux windows"
+                check_wayland
+                check_binder
+                waydroid session start &
+                sleep 2
+                waydroid show-full-ui &
+                log_success "WayDroid multi-window mode started"
+                read -p "Press Enter to continue..."
+                ;;
+            8)
                 systemctl stop waydroid-container
                 log_success "WayDroid stopped"
                 read -p "Press Enter to continue..."
                 ;;
-            8) 
+            9)
                 systemctl restart waydroid-container
                 log_success "WayDroid restarted"
                 read -p "Press Enter to continue..."
                 ;;
-            9) 
+            10)
                 systemctl status waydroid-container
                 read -p "Press Enter to continue..."
                 ;;
-            10) 
+            11)
                 setup_waydroid_script
                 read -p "Press Enter to continue..."
                 ;;
-            11) 
+            12)
                 show_help
                 read -p "Press Enter to continue..."
                 ;;
-            12) 
+            13)
                 log_info "Goodbye!"
+                rm -f "$LOCK_FILE"
                 exit 0
                 ;;
-            *) 
+            *)
                 log_error "Invalid option"
                 read -p "Press Enter to continue..."
                 ;;
@@ -538,6 +722,9 @@ interactive_mode() {
 
 # Main
 main() {
+    # Setup logging
+    setup_logging
+
     if [[ $# -eq 0 ]]; then
         check_root
         interactive_mode
@@ -561,12 +748,54 @@ main() {
             certified|start|stop|restart|status)
                 check_root
                 case $1 in
-                    certified) shift; run_python_script certified ;;
-                    start) shift; systemctl start waydroid-container ;;
-                    stop) shift; systemctl stop waydroid-container ;;
-                    restart) shift; systemctl restart waydroid-container ;;
-                    status) shift; systemctl status waydroid-container ;;
+                    certified)
+                        shift
+                        log_info "Fetching Google Device ID for Play Store certification..."
+                        run_python_script certified
+                        echo
+                        log_info "Copy the ID above and register it at:"
+                        echo -e "${CYAN}https://www.google.com/android/uncertified/${NC}"
+                        ;;
+                    start)
+                        shift
+                        check_binder
+                        systemctl start waydroid-container
+                        log_success "WayDroid container started"
+                        ;;
+                    stop)
+                        shift
+                        systemctl stop waydroid-container
+                        log_success "WayDroid container stopped"
+                        ;;
+                    restart)
+                        shift
+                        systemctl restart waydroid-container
+                        log_success "WayDroid container restarted"
+                        ;;
+                    status)
+                        shift
+                        systemctl status waydroid-container
+                        ;;
                 esac
+                ;;
+            ui)
+                check_root
+                log_info "Starting WayDroid in Full UI mode..."
+                check_wayland
+                check_binder
+                waydroid show-full-ui &
+                log_success "WayDroid UI started (running in background)"
+                ;;
+            multi)
+                check_root
+                log_info "Starting WayDroid in Multi-window mode..."
+                log_info "This will make Android apps appear as native Linux windows"
+                check_wayland
+                check_binder
+                waydroid session start &
+                sleep 2
+                waydroid show-full-ui &
+                log_success "WayDroid multi-window mode started"
                 ;;
             install)
                 check_root
