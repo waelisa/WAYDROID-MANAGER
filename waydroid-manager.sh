@@ -4,11 +4,12 @@
 # The MIT License (MIT)
 # Wael Isa
 # Build Date: 02/18/2026
-# Version: 2.1.7
+# Version: 2.1.8
 # https://github.com/waelisa/WAYDROID-MANAGER
 #############################################################################################################################
 # WayDroid Management Script - Complete Android container orchestrator for Linux
 # Features:
+#   ✓ Multi-distro support (Arch, Debian, Fedora, openSUSE)
 #   ✓ Proper Wayland detection with sudo
 #   ✓ Intelligent binder detection (DKMS vs built-in)
 #   ✓ Automatic binderfs mounting for Zen/CachyOS kernels
@@ -199,7 +200,7 @@ check_wayland_interactive() {
     echo ""
     echo "Waydroid requires a Wayland compositor for optimal performance."
     echo "Options:"
-    echo "  1) Log out and select 'Plasma (Wayland)' from your login manager"
+    echo "  1) Log out and select a Wayland session from your login manager"
     echo "  2) Run Weston (nested Wayland compositor): sudo weston"
     echo "  3) Continue anyway (may have issues)"
     echo ""
@@ -225,7 +226,7 @@ setup_firewall() {
     fi
 }
 
-# Install dependencies
+# Install dependencies based on distribution
 install_dependencies() {
     local distro=$(detect_distro)
     log_step "Installing dependencies for $distro"
@@ -252,7 +253,12 @@ install_dependencies() {
                 python3-virtualenv waydroid weston dkms || return 1
             ;;
         *)
-            log_warn "Unknown distribution"
+            log_warn "Unknown distribution: $distro"
+            echo "Please install the following packages manually:"
+            echo "  - lzip, git, python3, python3-pip, python3-venv"
+            echo "  - waydroid, weston"
+            echo "  - build tools (gcc, make, kernel headers)"
+            echo "  - dkms, mokutil (for Secure Boot detection)"
             read -p "Continue anyway? (y/N): " continue_anyway
             [[ ! "$continue_anyway" =~ ^[Yy]$ ]] && return 1
             ;;
@@ -292,7 +298,7 @@ install_binder_module() {
         setup_binderfs && return 0 || return 1
     fi
 
-    # Install DKMS module
+    # Install DKMS module based on distribution
     log_warn "Installing binder module via DKMS"
 
     case $distro in
@@ -301,21 +307,30 @@ install_binder_module() {
             [[ "$kernel_flavor" != "default" ]] && headers="linux-${kernel_flavor}-headers"
             pacman -S --noconfirm --needed "$headers" binder_linux-dkms || return 1
             ;;
-        debian|ubuntu)
+        debian|ubuntu|linuxmint|pop)
             apt update && apt install -y linux-headers-"$running_kernel" binder_linux-dkms || return 1
             ;;
-        fedora)
+        fedora|rhel|centos|rocky)
             dnf install -y kernel-devel-"$running_kernel" kernel-headers-"$running_kernel" binder_linux-dkms || return 1
             ;;
         opensuse*)
             zypper install -y kernel-devel kernel-default-devel binder_linux-dkms || return 1
+            ;;
+        *)
+            log_error "Unsupported distribution for automatic binder installation"
+            echo "Please install binder_linux-dkms manually for your distribution"
+            return 1
             ;;
     esac
 
     # Build with DKMS
     if command -v dkms &>/dev/null; then
         local binder_version=$(dkms status binder_linux 2>/dev/null | head -1 | sed -n 's/.*binder_linux\/\([^,]*\).*/\1/p' | tr -d ' ')
-        [[ -n "$binder_version" ]] && dkms install binder_linux/"$binder_version" -k "$running_kernel" &>/dev/null
+        if [[ -n "$binder_version" ]]; then
+            dkms install binder_linux/"$binder_version" -k "$running_kernel" &>/dev/null
+        else
+            dkms autoinstall -k "$running_kernel" &>/dev/null
+        fi
     fi
 
     depmod -a "$running_kernel"
@@ -348,13 +363,28 @@ check_binder_interactive() {
         1) install_binder_module ;;
         2)
             echo ""
-            echo "For Zen/CachyOS kernels:"
+            echo "For kernels with built-in binder (Zen/CachyOS):"
             echo "  sudo mkdir -p /dev/binderfs"
             echo "  sudo mount -t binder binder /dev/binderfs"
+            echo "  echo 'binder /dev/binderfs binder defaults 0 0' | sudo tee -a /etc/fstab"
             echo ""
             echo "For standard kernels:"
-            echo "  sudo pacman -S linux-$(get_kernel_flavor)-headers binder_linux-dkms"
+            case $(detect_distro) in
+                arch*|manjaro*)
+                    echo "  sudo pacman -S linux-$(get_kernel_flavor)-headers binder_linux-dkms"
+                    ;;
+                debian*|ubuntu*)
+                    echo "  sudo apt install linux-headers-$(uname -r) binder_linux-dkms"
+                    ;;
+                fedora*)
+                    echo "  sudo dnf install kernel-devel-$(uname -r) kernel-headers-$(uname -r) binder_linux-dkms"
+                    ;;
+                *)
+                    echo "  Install binder_linux-dkms and matching kernel headers for your distribution"
+                    ;;
+            esac
             echo "  sudo modprobe binder_linux"
+            echo "  echo 'binder_linux' | sudo tee /etc/modules-load.d/waydroid.conf"
             read -p "Press Enter to continue..."
             return 1
             ;;
@@ -407,25 +437,33 @@ run_python_script() {
     "${PYTHON_SCRIPT}" "$MAIN_PY" "$@"
 }
 
-# Install WayDroid on Arch
-install_arch() {
+# Install WayDroid (distribution-agnostic)
+install_waydroid() {
     log_header "INSTALLING WAYDROID"
 
-    log_step "Updating system"
-    pacman -Syu --noconfirm || return 1
+    local distro=$(detect_distro)
+    log_info "Detected distribution: $distro"
 
-    log_step "Installing WayDroid"
-    pacman -S --noconfirm waydroid weston lzip git python python-pip python-virtualenv ufw || return 1
+    # Install dependencies first
+    install_dependencies || return 1
 
+    # Check binder
     check_binder_interactive
-    setup_firewall
 
+    # Initialize WayDroid if needed
     if [[ ! -d "/var/lib/waydroid/images" ]]; then
         log_step "Initializing WayDroid"
         waydroid init || return 1
     fi
 
-    systemctl enable --now waydroid-container || return 1
+    # Start service
+    log_step "Starting WayDroid container service"
+    systemctl enable --now waydroid-container 2>/dev/null || {
+        log_warn "Could not enable service automatically"
+        echo "You may need to start WayDroid manually:"
+        echo "  sudo systemctl start waydroid-container"
+    }
+
     log_success "WayDroid installed successfully"
 }
 
@@ -453,6 +491,8 @@ install_apps_menu() {
         [[ -z "$selections" ]] && continue
 
         local args=()
+        local mitm_cert=""
+
         for num in $selections; do
             case $num in
                 1) args+=("gapps") ;;
@@ -466,14 +506,19 @@ install_apps_menu() {
                 9) args+=("nodataperm") ;;
                 10) args+=("hidestatusbar") ;;
                 11)
-                    read -p "Enter CA certificate path: " cert
-                    [[ -f "$cert" ]] && run_python_script install mitm --ca-cert "$cert"
+                    read -p "Enter CA certificate path: " mitm_cert
                     ;;
                 *) log_warn "Invalid: $num" ;;
             esac
         done
 
-        [[ ${#args[@]} -gt 0 ]] && run_python_script install "${args[@]}"
+        if [[ -n "$mitm_cert" ]] && [[ -f "$mitm_cert" ]]; then
+            [[ ${#args[@]} -gt 0 ]] && run_python_script install "${args[@]}"
+            run_python_script install mitm --ca-cert "$mitm_cert"
+        elif [[ ${#args[@]} -gt 0 ]]; then
+            run_python_script install "${args[@]}"
+        fi
+
         read -p "Press Enter to continue..."
     done
 }
@@ -531,7 +576,7 @@ show_help() {
     echo "Usage: $0 [command]"
     echo
     echo "Commands:"
-    echo "  install-arch    - Install WayDroid"
+    echo "  install         - Install WayDroid"
     echo "  install-deps    - Install dependencies"
     echo "  setup           - Setup waydroid_script"
     echo "  ui              - Start WayDroid UI"
@@ -542,6 +587,11 @@ show_help() {
     echo "  hack            - Apply hacks"
     echo "  check-binder    - Check/fix binder"
     echo "  clean           - Remove lock files"
+    echo ""
+    echo "Examples:"
+    echo "  sudo $0 install"
+    echo "  sudo $0 install gapps microg magisk"
+    echo "  sudo $0 ui"
 }
 
 # Main menu
@@ -562,7 +612,7 @@ interactive_mode() {
 
     while true; do
         clear
-        log_header "WAYDROID MANAGER v2.1.7"
+        log_header "WAYDROID MANAGER v2.1.8"
 
         # Simple status indicators
         local wl_status="${RED}✗${NC}"
@@ -587,15 +637,15 @@ interactive_mode() {
         echo -e "${CYAN}Status:${NC} Wayland [$wl_status] Binder [$binder_status] WayDroid [$wd_status]"
         echo -e "${CYAN}Log:${NC} $LOG_FILE"
         echo "──────────────────────────────────"
-        echo "1) Install WayDroid (Arch)"
-        echo "2) Install Apps"
-        echo "3) Remove Apps"
-        echo "4) Get Play Store ID"
-        echo "5) Apply Hacks"
-        echo "6) Start WayDroid (Full UI)"
-        echo "7) Start WayDroid (Multi-window)"
-        echo "8) Stop WayDroid"
-        echo "9) Restart WayDroid"
+        echo "1)  Install WayDroid"
+        echo "2)  Install Apps"
+        echo "3)  Remove Apps"
+        echo "4)  Get Play Store ID"
+        echo "5)  Apply Hacks"
+        echo "6)  Start WayDroid (Full UI)"
+        echo "7)  Start WayDroid (Multi-window)"
+        echo "8)  Stop WayDroid"
+        echo "9)  Restart WayDroid"
         echo "10) Check/Fix Binder"
         echo "11) Setup/Update waydroid_script"
         echo "12) Install Dependencies"
@@ -605,7 +655,7 @@ interactive_mode() {
         read -p "Select [1-14]: " choice
 
         case $choice in
-            1)  install_arch ;;
+            1)  install_waydroid ;;
             2)  install_apps_menu ;;
             3)  remove_apps_menu ;;
             4)  run_python_script certified ;;
@@ -670,9 +720,9 @@ main() {
     else
         case $1 in
             help|--help|-h)  show_help ;;
-            setup)           check_root; setup_waydroid_script ;;
+            install)         check_root; install_waydroid ;;
             install-deps)    check_root; install_dependencies ;;
-            install-arch)    check_root; install_arch ;;
+            setup)           check_root; setup_waydroid_script ;;
             check-binder)    check_root; check_binder_interactive ;;
             ui)              check_root; check_wayland_interactive && check_binder_interactive && waydroid show-full-ui & ;;
             multi)           check_root; check_wayland_interactive && check_binder_interactive && waydroid session start && sleep 2 && waydroid show-full-ui & ;;
@@ -681,7 +731,7 @@ main() {
             restart)         check_root; systemctl restart waydroid-container ;;
             status)          systemctl status waydroid-container ;;
             certified)       check_root; run_python_script certified ;;
-            install)         check_root; shift; run_python_script install "$@" ;;
+            install-cmd)     check_root; shift; run_python_script install "$@" ;;
             remove|uninstall) check_root; shift; run_python_script uninstall "$@" ;;
             hack)            check_root; shift; run_python_script hack "$@" ;;
             clean)           rm -f "$LOCK_FILE" 2>/dev/null; echo "Lock files cleaned" ;;
