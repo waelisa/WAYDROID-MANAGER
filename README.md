@@ -5,6 +5,8 @@
 
 A powerful Bash script to easily manage your WayDroid installation. It automates installing Google Apps, MicroG, Magisk, ARM translation layers, Widevine, and various system tweaks by seamlessly integrating with the popular [waydroid_script](https://github.com/casualsnek/waydroid_script).
 
+More info here too [WayDroid Manager](https://www.wael.name/waydroid-manager/)
+
 This script provides both an interactive menu and a command-line interface, making WayDroid management simple for everyone.
 
 ## ✨ Features
