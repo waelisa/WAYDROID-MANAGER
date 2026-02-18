@@ -9,26 +9,6 @@
 #############################################################################################################################
 # WayDroid Management Script - Complete Android container orchestrator for Linux
 # Automatically manages WayDroid Android container on Linux with industrial-grade reliability
-# Features:
-#   ✓ Multi-distro support (Arch, Debian, Fedora, openSUSE)
-#   ✓ Automatic waydroid_script integration with Python venv
-#   ✓ ARM translation layers (libndk/libhoudini) for x86 systems
-#   ✓ Google Apps/MicroG installation with Play Store certification
-#   ✓ Magisk root integration for system-level access
-#   ✓ Widevine DRM L3 support for streaming services
-#   ✓ Desktop mode launcher (smartdock)
-#   ✓ Interactive menu system with color-coded output
-#   ✓ Systemd service management with status monitoring
-#   ✓ Binder module verification and auto-loading with kernel header detection
-#   ✓ Firewall configuration for network bridge
-#   ✓ Wayland session detection with fallback options
-#   ✓ Multi-window and full UI mode support
-#   ✓ MITM certificate installation for development
-#   ✓ Android 11 specific hacks (NoDataPerm, hide status bar)
-#   ✓ Comprehensive error trapping with cleanup
-#   ✓ Root privilege validation with sudo detection
-#   ✓ Lock file protection against concurrent runs
-#   ✓ Secure logging with rotation capabilities
 #############################################################################################################################
 
 set -euo pipefail
@@ -70,7 +50,7 @@ cleanup() {
         rm -f "$LOCK_FILE" 2>/dev/null
     fi
     if [[ $exit_code -ne 0 ]]; then
-        log_error "Script exited with error code: $exit_code"
+        echo -e "${RED}${CROSS_MARK} [ERROR] Script exited with error code: $exit_code${NC}" | tee -a "$LOG_FILE"
     fi
     exit $exit_code
 }
@@ -98,15 +78,20 @@ log_header() {
 
 # Initialize log file
 setup_logging() {
-    touch "$LOG_FILE" 2>/dev/null || sudo touch "$LOG_FILE"
-    chmod 640 "$LOG_FILE" 2>/dev/null || sudo chmod 640 "$LOG_FILE"
+    # Try to create log file with sudo if needed
+    if ! touch "$LOG_FILE" 2>/dev/null; then
+        sudo touch "$LOG_FILE" 2>/dev/null || true
+    fi
+    if ! chmod 640 "$LOG_FILE" 2>/dev/null; then
+        sudo chmod 640 "$LOG_FILE" 2>/dev/null || true
+    fi
     log_info "Logging initialized: $LOG_FILE"
 }
 
 # Check root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root"
+        echo -e "${RED}${CROSS_MARK} [ERROR] This script must be run as root${NC}"
         echo -e "${YELLOW}Try: sudo $0${NC}"
         exit 1
     fi
@@ -247,12 +232,15 @@ install_binder_module() {
 
             # Load the module
             log_step "Loading binder module"
-            modprobe binder_linux 2>/dev/null || modprobe binder-linux 2>/dev/null || {
+            if modprobe binder_linux 2>/dev/null || modprobe binder-linux 2>/dev/null; then
+                log_success "Binder module loaded successfully"
+                return 0
+            else
                 log_error "Failed to load binder_linux after installing headers."
                 log_info "You may need to reboot or rebuild the module with:"
                 echo "  sudo dkms install binder_linux/$(modinfo binder_linux 2>/dev/null | grep ^version | awk '{print $2}')"
                 return 1
-            }
+            fi
             ;;
 
         debian|ubuntu|linuxmint|pop)
@@ -356,7 +344,6 @@ install_dependencies() {
     case $distro in
         arch|manjaro|endeavouros)
             pacman -S --noconfirm lzip git python python-pip python-virtualenv waydroid weston ufw
-            # Don't install binder_linux-dkms and headers here - they'll be handled by check_binder
             ;;
         debian|ubuntu|linuxmint|pop)
             apt update
@@ -378,71 +365,8 @@ install_dependencies() {
             ;;
     esac
 
-    # Verify binder module after installation
-    check_binder
-
-    # Setup firewall
-    setup_firewall
-
     log_success "Dependencies installed"
 }
-
-# Install WayDroid on Arch Linux
-install_arch() {
-    log_header "STEP 2: INSTALLING WAYDROID ON ARCH LINUX"
-
-    # Check for Wayland
-    check_wayland
-
-    # Check if running on Arch
-    local distro=$(detect_distro)
-    if [[ "$distro" != "arch" && "$distro" != "manjaro" && "$distro" != "endeavouros" ]]; then
-        log_warn "This installation is optimized for Arch Linux and derivatives"
-        echo -e "Detected distribution: ${YELLOW}$distro${NC}"
-        echo -e "Continue anyway? (y/N): "
-        read -r continue_anyway
-        if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
-            log_info "Installation cancelled"
-            return 1
-        fi
-    fi
-
-    log_step "Updating system"
-    pacman -Syu --noconfirm
-
-    log_step "Installing WayDroid and base dependencies"
-    pacman -S --noconfirm waydroid weston lzip git python python-pip python-virtualenv ufw
-
-    # Check binder module - this will handle kernel headers and binder_linux-dkms installation
-    check_binder
-
-    # Setup firewall
-    setup_firewall
-
-    # Initialize WayDroid if needed
-    if [[ ! -d "/var/lib/waydroid/images" ]]; then
-        log_step "Initializing WayDroid"
-        waydroid init
-    fi
-
-    # Start service
-    log_step "Starting WayDroid container service"
-    systemctl enable --now waydroid-container
-
-    log_success "WayDroid installed successfully"
-
-    # Provide next steps
-    echo
-    log_info "Next steps:"
-    echo "  1. Run 'sudo $0 ui' to start WayDroid in full UI mode"
-    echo "  2. Or run 'sudo $0 multi' for multi-window mode"
-    echo "  3. Run 'sudo $0 install gapps' to install Google Apps"
-    echo "  4. For ARM apps on x86, install: libndk (AMD) or libhoudini (Intel)"
-    echo "  5. Get Play Store certification: sudo $0 certified"
-}
-
-# [Rest of the script remains the same - install_apps_menu, remove_apps_menu, show_help, etc.]
-# ... (keep all the subsequent functions unchanged)
 
 # Run the Python script with arguments
 run_python_script() {
@@ -500,8 +424,531 @@ setup_waydroid_script() {
     log_success "waydroid_script setup complete"
 }
 
-# [Keep all the other functions: install_apps_menu, remove_apps_menu, show_help, interactive_mode, main]
-# ... (copy them unchanged from the original script)
+# Install WayDroid on Arch Linux
+install_arch() {
+    log_header "STEP 2: INSTALLING WAYDROID ON ARCH LINUX"
 
-# Main menu and other functions remain exactly the same as in the original script
-# I'll include them here but for brevity in this diff, I'm noting they should be kept
+    # Check for Wayland
+    check_wayland
+
+    # Check if running on Arch
+    local distro=$(detect_distro)
+    if [[ "$distro" != "arch" && "$distro" != "manjaro" && "$distro" != "endeavouros" ]]; then
+        log_warn "This installation is optimized for Arch Linux and derivatives"
+        echo -e "Detected distribution: ${YELLOW}$distro${NC}"
+        echo -e "Continue anyway? (y/N): "
+        read -r continue_anyway
+        if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
+            log_info "Installation cancelled"
+            return 1
+        fi
+    fi
+
+    log_step "Updating system"
+    pacman -Syu --noconfirm
+
+    log_step "Installing WayDroid and base dependencies"
+    pacman -S --noconfirm waydroid weston lzip git python python-pip python-virtualenv ufw
+
+    # Check binder module - this will handle kernel headers and binder_linux-dkms installation
+    check_binder
+
+    # Setup firewall
+    setup_firewall
+
+    # Initialize WayDroid if needed
+    if [[ ! -d "/var/lib/waydroid/images" ]]; then
+        log_step "Initializing WayDroid"
+        waydroid init
+    fi
+
+    # Start service
+    log_step "Starting WayDroid container service"
+    systemctl enable --now waydroid-container
+
+    log_success "WayDroid installed successfully"
+
+    # Provide next steps
+    echo
+    log_info "Next steps:"
+    echo "  1. Run 'sudo $0 ui' to start WayDroid in full UI mode"
+    echo "  2. Or run 'sudo $0 multi' for multi-window mode"
+    echo "  3. Run 'sudo $0 install gapps' to install Google Apps"
+    echo "  4. For ARM apps on x86, install: libndk (AMD) or libhoudini (Intel)"
+    echo "  5. Get Play Store certification: sudo $0 certified"
+}
+
+# Install apps submenu
+install_apps_menu() {
+    while true; do
+        clear
+        log_header "INSTALL APPS MENU"
+        echo -e "${CYAN}Select apps to install (enter numbers separated by spaces):${NC}"
+        echo
+        echo " 1) gapps         - Google Apps"
+        echo " 2) microg        - MicroG (open source Google services)"
+        echo " 3) libndk        - ARM translation for AMD CPUs"
+        echo " 4) libhoudini    - ARM translation for Intel CPUs"
+        echo " 5) magisk        - Magisk Delta for root"
+        echo " 6) widevine      - Widevine DRM L3"
+        echo " 7) smartdock     - Desktop mode launcher"
+        echo " 8) fdroidpriv    - FDroid Privileged Extension"
+        echo " 9) nodataperm    - NoDataPerm hack (Android 11 only)"
+        echo "10) hidestatusbar - Hide status bar hack (Android 11 only)"
+        echo "11) mitm          - MITM CA certificate (requires certificate file)"
+        echo " 0) Back to main menu"
+        echo
+        echo -n "Enter selection (e.g., '1 3 5'): "
+
+        read -r selections
+
+        if [[ "$selections" == "0" ]]; then
+            return 0
+        fi
+
+        if [[ -z "$selections" ]]; then
+            log_error "No selection made"
+            read -p "Press Enter to continue..."
+            continue
+        fi
+
+        # Build the install command
+        local install_args=()
+        local has_mitm=0
+
+        for num in $selections; do
+            case $num in
+                1) install_args+=("gapps") ;;
+                2) install_args+=("microg") ;;
+                3) install_args+=("libndk") ;;
+                4) install_args+=("libhoudini") ;;
+                5) install_args+=("magisk") ;;
+                6) install_args+=("widevine") ;;
+                7) install_args+=("smartdock") ;;
+                8) install_args+=("fdroidpriv") ;;
+                9) install_args+=("nodataperm") ;;
+                10) install_args+=("hidestatusbar") ;;
+                11) has_mitm=1 ;;
+                *) log_warn "Invalid selection: $num" ;;
+            esac
+        done
+
+        # Handle MITM separately (needs certificate file)
+        if [[ $has_mitm -eq 1 ]]; then
+            echo
+            echo -n "Enter path to CA certificate file for MITM: "
+            read -r cert_path
+            if [[ -f "$cert_path" ]]; then
+                # MITM needs to be run separately with --ca-cert
+                if [[ ${#install_args[@]} -gt 0 ]]; then
+                    log_info "Installing: ${install_args[*]}"
+                    run_python_script install "${install_args[@]}"
+                fi
+                log_info "Installing MITM with certificate"
+                run_python_script install mitm --ca-cert "$cert_path"
+            else
+                log_error "Certificate file not found: $cert_path"
+            fi
+        else
+            if [[ ${#install_args[@]} -gt 0 ]]; then
+                log_info "Installing: ${install_args[*]}"
+                run_python_script install "${install_args[@]}"
+            else
+                log_warn "No valid apps selected"
+            fi
+        fi
+
+        echo
+        read -p "Press Enter to continue..."
+    done
+}
+
+# Remove apps submenu
+remove_apps_menu() {
+    while true; do
+        clear
+        log_header "REMOVE APPS MENU"
+        echo -e "${CYAN}Select apps to remove (enter numbers separated by spaces):${NC}"
+        echo
+        echo " 1) gapps         - Google Apps"
+        echo " 2) microg        - MicroG"
+        echo " 3) libndk        - ARM translation for AMD CPUs"
+        echo " 4) libhoudini    - ARM translation for Intel CPUs"
+        echo " 5) magisk        - Magisk Delta"
+        echo " 6) widevine      - Widevine DRM L3"
+        echo " 7) smartdock     - Desktop mode launcher"
+        echo " 8) fdroidpriv    - FDroid Privileged Extension"
+        echo " 9) nodataperm    - NoDataPerm hack"
+        echo "10) hidestatusbar - Hide status bar hack"
+        echo "11) mitm          - MITM CA certificate"
+        echo " 0) Back to main menu"
+        echo
+        echo -n "Enter selection (e.g., '1 3 5'): "
+
+        read -r selections
+
+        if [[ "$selections" == "0" ]]; then
+            return 0
+        fi
+
+        if [[ -z "$selections" ]]; then
+            log_error "No selection made"
+            read -p "Press Enter to continue..."
+            continue
+        fi
+
+        local remove_args=()
+
+        for num in $selections; do
+            case $num in
+                1) remove_args+=("gapps") ;;
+                2) remove_args+=("microg") ;;
+                3) remove_args+=("libndk") ;;
+                4) remove_args+=("libhoudini") ;;
+                5) remove_args+=("magisk") ;;
+                6) remove_args+=("widevine") ;;
+                7) remove_args+=("smartdock") ;;
+                8) remove_args+=("fdroidpriv") ;;
+                9) remove_args+=("nodataperm") ;;
+                10) remove_args+=("hidestatusbar") ;;
+                11) remove_args+=("mitm") ;;
+                *) log_warn "Invalid selection: $num" ;;
+            esac
+        done
+
+        if [[ ${#remove_args[@]} -gt 0 ]]; then
+            log_info "Removing: ${remove_args[*]}"
+            run_python_script uninstall "${remove_args[@]}"
+        else
+            log_warn "No valid apps selected"
+        fi
+
+        echo
+        read -p "Press Enter to continue..."
+    done
+}
+
+# Show help
+show_help() {
+    clear
+    log_header "WAYDROID MANAGEMENT SCRIPT - HELP"
+
+    echo -e "${CYAN}${BOLD}USAGE:${NC}"
+    echo -e "    $0 [COMMAND] [OPTIONS]"
+    echo
+
+    echo -e "${GREEN}${BOLD}COMMANDS:${NC}"
+    echo -e "    ${BOLD}Setup:${NC}"
+    echo -e "    setup              Clone and setup waydroid_script"
+    echo -e "    install-deps       Install required system dependencies"
+    echo
+    echo -e "    ${BOLD}Installation:${NC}"
+    echo -e "    install-arch       Install WayDroid on Arch Linux"
+    echo
+    echo -e "    ${BOLD}App Management (via waydroid_script):${NC}"
+    echo -e "    install <apps>     Install apps (gapps, microg, libndk, libhoudini, etc.)"
+    echo -e "    remove <apps>      Remove apps"
+    echo -e "    certified          Get Android ID for Play Store certification"
+    echo -e "    hack <hacks>       Apply hacks (nodataperm, hidestatusbar)"
+    echo
+    echo -e "    ${BOLD}UI Modes:${NC}"
+    echo -e "    ui                 Start WayDroid in full UI mode (desktop environment)"
+    echo -e "    multi              Start WayDroid in multi-window mode (apps as Linux windows)"
+    echo
+    echo -e "    ${BOLD}Service:${NC}"
+    echo -e "    start              Start WayDroid container"
+    echo -e "    stop               Stop WayDroid container"
+    echo -e "    restart            Restart WayDroid container"
+    echo -e "    status             Show container status"
+    echo
+    echo -e "    ${BOLD}Utilities:${NC}"
+    echo -e "    help               Show this help"
+    echo
+    echo -e "${GREEN}${BOLD}AVAILABLE APPS:${NC}"
+    echo -e "    ${YELLOW}Core:${NC}"
+    echo -e "    gapps          - Google Apps"
+    echo -e "    microg         - MicroG (open source Google services)"
+    echo
+    echo -e "    ${YELLOW}Translation:${NC}"
+    echo -e "    libndk         - ARM translation (better for AMD CPUs)"
+    echo -e "    libhoudini     - ARM translation (better for Intel CPUs)"
+    echo
+    echo -e "    ${YELLOW}Enhancements:${NC}"
+    echo -e "    magisk         - Magisk Delta for root access"
+    echo -e "    widevine       - Widevine DRM L3 support"
+    echo -e "    smartdock      - Desktop mode launcher"
+    echo -e "    fdroidpriv     - FDroid Privileged Extension"
+    echo -e "    mitm           - MITM CA certificate (use --ca-cert cert.pem)"
+    echo
+    echo -e "    ${YELLOW}Hacks (Android 11 only):${NC}"
+    echo -e "    nodataperm     - Remove data permissions from all apps"
+    echo -e "    hidestatusbar  - Hide Android status bar"
+    echo
+    echo -e "${GREEN}${BOLD}EXAMPLES:${NC}"
+    echo -e "    # First time setup"
+    echo -e "    sudo $0 install-deps"
+    echo -e "    sudo $0 setup"
+    echo
+    echo -e "    # Install WayDroid on Arch"
+    echo -e "    sudo $0 install-arch"
+    echo
+    echo -e "    # Start WayDroid UI"
+    echo -e "    sudo $0 ui"
+    echo
+    echo -e "    # Install multiple components"
+    echo -e "    sudo $0 install gapps microg magisk"
+    echo
+    echo -e "    # Install ARM translation for Intel CPU"
+    echo -e "    sudo $0 install libhoudini"
+    echo
+    echo -e "    # Get Google certification ID"
+    echo -e "    sudo $0 certified"
+    echo
+    echo -e "${YELLOW}${BOLD}NOTE: Most commands require root privileges (sudo)${NC}"
+}
+
+# Main menu
+interactive_mode() {
+    # Setup logging first
+    setup_logging
+
+    # Create lock file to prevent concurrent runs
+    if [[ -f "$LOCK_FILE" ]]; then
+        log_error "Another instance is already running (lock file: $LOCK_FILE)"
+        exit 1
+    fi
+    touch "$LOCK_FILE"
+
+    while true; do
+        clear
+        log_header "WAYDROID MANAGER - by Wael Isa (v2.1.1)"
+        echo -e "${CYAN}System:${NC} $(detect_distro) | $(get_host_arch) | Kernel: $(uname -r)"
+        echo -e "${CYAN}Wayland:${NC} ${WAYLAND_DISPLAY:-Not detected}"
+        echo -e "${CYAN}Binder Module:${NC} $(lsmod | grep -q binder_linux && echo "${GREEN}Loaded${NC}" || echo "${RED}Not loaded${NC}")"
+        echo -e "${CYAN}Waydroid Script:${NC} $([[ -f "$MAIN_PY" ]] && echo "${GREEN}Installed${NC}" || echo "${RED}Not installed${NC}")"
+        echo -e "${CYAN}Log File:${NC} $LOG_FILE"
+        echo
+
+        echo "1) Install WayDroid on Arch Linux"
+        echo "2) Install Apps (via waydroid_script)"
+        echo "3) Remove Apps (via waydroid_script)"
+        echo "4) Get Android ID (Play Store Certification)"
+        echo "5) Apply Hacks"
+        echo "6) Start WayDroid (Full UI Mode)"
+        echo "7) Start WayDroid (Multi-window Mode)"
+        echo "8) Stop WayDroid"
+        echo "9) Restart WayDroid"
+        echo "10) Show Status"
+        echo "11) Update waydroid_script"
+        echo "12) Install Dependencies"
+        echo "13) Setup waydroid_script"
+        echo "14) Check Binder Module"
+        echo "15) Help"
+        echo "16) Exit"
+        echo
+        echo -n "Select [1-16]: "
+
+        read -r choice
+        case $choice in
+            1)
+                install_arch
+                read -p "Press Enter to continue..."
+                ;;
+            2)
+                install_apps_menu
+                ;;
+            3)
+                remove_apps_menu
+                ;;
+            4)
+                log_info "Fetching Google Device ID for Play Store certification..."
+                run_python_script certified
+                echo
+                log_info "Copy the ID above and register it at:"
+                echo -e "${CYAN}https://www.google.com/android/uncertified/${NC}"
+                read -p "Press Enter to continue..."
+                ;;
+            5)
+                echo
+                echo -e "${CYAN}Available hacks:${NC}"
+                echo "  nodataperm     - NoDataPerm hack (Android 11)"
+                echo "  hidestatusbar  - Hide status bar hack"
+                echo
+                echo -n "Enter hack to apply: "
+                read -r hack
+                if [[ -n "$hack" ]]; then
+                    run_python_script hack "$hack"
+                fi
+                read -p "Press Enter to continue..."
+                ;;
+            6)
+                log_info "Starting WayDroid in Full UI mode..."
+                check_wayland
+                check_binder
+                waydroid show-full-ui &
+                log_success "WayDroid UI started (running in background)"
+                read -p "Press Enter to continue..."
+                ;;
+            7)
+                log_info "Starting WayDroid in Multi-window mode..."
+                log_info "This will make Android apps appear as native Linux windows"
+                check_wayland
+                check_binder
+                waydroid session start &
+                sleep 2
+                waydroid show-full-ui &
+                log_success "WayDroid multi-window mode started"
+                read -p "Press Enter to continue..."
+                ;;
+            8)
+                systemctl stop waydroid-container
+                log_success "WayDroid stopped"
+                read -p "Press Enter to continue..."
+                ;;
+            9)
+                systemctl restart waydroid-container
+                log_success "WayDroid restarted"
+                read -p "Press Enter to continue..."
+                ;;
+            10)
+                systemctl status waydroid-container
+                read -p "Press Enter to continue..."
+                ;;
+            11)
+                setup_waydroid_script
+                read -p "Press Enter to continue..."
+                ;;
+            12)
+                install_dependencies
+                read -p "Press Enter to continue..."
+                ;;
+            13)
+                setup_waydroid_script
+                read -p "Press Enter to continue..."
+                ;;
+            14)
+                check_binder
+                read -p "Press Enter to continue..."
+                ;;
+            15)
+                show_help
+                read -p "Press Enter to continue..."
+                ;;
+            16)
+                log_info "Goodbye!"
+                rm -f "$LOCK_FILE"
+                exit 0
+                ;;
+            *)
+                log_error "Invalid option"
+                read -p "Press Enter to continue..."
+                ;;
+        esac
+    done
+}
+
+# Main
+main() {
+    # Setup logging
+    setup_logging
+
+    if [[ $# -eq 0 ]]; then
+        # No arguments - check root and go to interactive mode
+        check_root
+        interactive_mode
+    else
+        case $1 in
+            help|--help|-h)
+                show_help
+                ;;
+            setup)
+                check_root
+                setup_waydroid_script
+                ;;
+            install-deps)
+                check_root
+                install_dependencies
+                ;;
+            install-arch)
+                check_root
+                install_arch
+                ;;
+            certified|start|stop|restart|status)
+                check_root
+                case $1 in
+                    certified)
+                        shift
+                        log_info "Fetching Google Device ID for Play Store certification..."
+                        run_python_script certified
+                        echo
+                        log_info "Copy the ID above and register it at:"
+                        echo -e "${CYAN}https://www.google.com/android/uncertified/${NC}"
+                        ;;
+                    start)
+                        shift
+                        check_binder
+                        systemctl start waydroid-container
+                        log_success "WayDroid container started"
+                        ;;
+                    stop)
+                        shift
+                        systemctl stop waydroid-container
+                        log_success "WayDroid container stopped"
+                        ;;
+                    restart)
+                        shift
+                        systemctl restart waydroid-container
+                        log_success "WayDroid container restarted"
+                        ;;
+                    status)
+                        shift
+                        systemctl status waydroid-container
+                        ;;
+                esac
+                ;;
+            ui)
+                check_root
+                log_info "Starting WayDroid in Full UI mode..."
+                check_wayland
+                check_binder
+                waydroid show-full-ui &
+                log_success "WayDroid UI started (running in background)"
+                ;;
+            multi)
+                check_root
+                log_info "Starting WayDroid in Multi-window mode..."
+                log_info "This will make Android apps appear as native Linux windows"
+                check_wayland
+                check_binder
+                waydroid session start &
+                sleep 2
+                waydroid show-full-ui &
+                log_success "WayDroid multi-window mode started"
+                ;;
+            install)
+                check_root
+                shift
+                run_python_script install "$@"
+                ;;
+            remove|uninstall)
+                check_root
+                shift
+                run_python_script uninstall "$@"
+                ;;
+            hack)
+                check_root
+                shift
+                run_python_script hack "$@"
+                ;;
+            *)
+                log_error "Unknown command: $1"
+                echo
+                show_help
+                exit 1
+                ;;
+        esac
+    fi
+}
+
+# Run main with all arguments
+main "$@"
