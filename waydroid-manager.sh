@@ -4,16 +4,20 @@
 # The MIT License (MIT)
 # Wael Isa
 # Build Date: 02/18/2026
-# Version: 2.1.8
+# Version: 2.2.2
 # https://github.com/waelisa/WAYDROID-MANAGER
 #############################################################################################################################
 # WayDroid Management Script - Complete Android container orchestrator for Linux
 # Features:
 #   ✓ Multi-distro support (Arch, Debian, Fedora, openSUSE)
-#   ✓ Proper Wayland detection with sudo
-#   ✓ Intelligent binder detection (DKMS vs built-in)
-#   ✓ Automatic binderfs mounting for Zen/CachyOS kernels
-#   ✓ Clean status display
+#   ✓ Gold Standard binder detection for all kernel types
+#   ✓ Automatic binderfs mounting with intelligent fstab management
+#   ✓ Secure Boot detection and handling
+#   ✓ Smart lock file management with crash detection
+#   ✓ Firewall rule verification
+#   ✓ MITM certificate validation
+#   ✓ Wayland session detection with sudo support
+#   ✓ Industrial-grade error handling and recovery
 #############################################################################################################################
 
 set -u
@@ -48,14 +52,16 @@ TEMP_DIR="/tmp/waydroid-install-$$"
 
 # Get the original user (the one who ran sudo)
 ORIGINAL_USER="${SUDO_USER:-$USER}"
+ORIGINAL_UID=$(id -u "$ORIGINAL_USER" 2>/dev/null || echo 1000)
 
 # Cleanup function
 cleanup() {
     local exit_code=$?
     [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR" 2>/dev/null
     [[ -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE" 2>/dev/null
-    if [[ $exit_code -ne 0 ]]; then
-        echo -e "${RED}${CROSS_MARK} [ERROR] Script exited with error code: $exit_code${NC}" | tee -a "$LOG_FILE"
+    if [[ $exit_code -ne 0 && $exit_code -ne 130 && $exit_code -ne 143 ]]; then
+        echo -e "${RED}${CROSS_MARK} [ERROR] Script exited unexpectedly with code: $exit_code${NC}" | tee -a "$LOG_FILE"
+        echo -e "${YELLOW}Run 'sudo $0 clean' to remove lock files if needed${NC}"
     fi
     exit $exit_code
 }
@@ -101,11 +107,11 @@ command_exists() {
     command -v "$1" &>/dev/null
 }
 
-# Improved Wayland detection that works with sudo
+# Wayland detection that works with sudo
 is_wayland_active() {
     # Method 1: Check if running under sudo and get original user's session
     if [[ -n "${SUDO_USER:-}" ]]; then
-        local uid=$(id -u "$ORIGINAL_USER")
+        local uid=$ORIGINAL_UID
 
         # Check for Wayland socket in user's runtime directory
         if [[ -S "/run/user/$uid/wayland-0" ]] || [[ -S "/run/user/$uid/wayland-1" ]]; then
@@ -133,21 +139,55 @@ is_waydroid_installed() {
     command -v waydroid &>/dev/null && [[ -d "/var/lib/waydroid" ]]
 }
 
-# Check if WayDroid container is running
+# WayDroid running detection (checks both service and process)
 is_waydroid_running() {
-    systemctl is-active --quiet waydroid-container 2>/dev/null
+    # Check systemd service
+    systemctl is-active --quiet waydroid-container 2>/dev/null && return 0
+
+    # Check for running waydroid processes as fallback
+    pgrep -f "waydroid" >/dev/null && return 0
+
+    return 1
 }
 
-# Improved binder detection
+# Check if firewall rules are active
+is_firewall_configured() {
+    if command_exists ufw; then
+        ufw status verbose | grep -q "waydroid0" && return 0
+    elif command_exists nft; then
+        nft list ruleset | grep -q "waydroid0" && return 0
+    elif command_exists iptables; then
+        iptables -L FORWARD -n | grep -q "waydroid0" && return 0
+    fi
+    return 1
+}
+
+# Check if binder is available in the system
 is_binder_available() {
     lsmod | grep -qE "binder_linux|binder" && return 0
     grep -q "binder" /proc/filesystems && return 0
     return 1
 }
 
+# GOLD STANDARD: Check if binder is actually working (detects all kernel types)
 is_binder_working() {
+    # 1. Check for legacy modules
     lsmod | grep -qE "binder_linux|binder" && return 0
-    mount | grep -q "binder" && return 0
+
+    # 2. Check proc for active mounts (more reliable than 'mount' command)
+    grep -q "binder" /proc/mounts 2>/dev/null && return 0
+
+    # 3. Check for actual character device nodes (The Gold Standard for Zen/CachyOS)
+    [[ -c "/dev/binderfs/binder-control" ]] && return 0
+    [[ -c "/dev/binder/binder-control" ]] && return 0
+    [[ -c "/dev/binder-control" ]] && return 0
+
+    # 4. Check if binder is in filesystems and we can access common mount points
+    if grep -q "binder" /proc/filesystems; then
+        [[ -d "/dev/binderfs" ]] && return 0
+        [[ -d "/dev/binder" ]] && return 0
+    fi
+
     return 1
 }
 
@@ -176,17 +216,75 @@ get_kernel_flavor() {
     echo "default"
 }
 
-# Setup binderfs for kernels with built-in binder
+# Check if process is still running (for lock file management)
+is_process_running() {
+    local pid="$1"
+    [[ -d "/proc/$pid" ]] && return 0
+    return 1
+}
+
+# Smart lock file management
+acquire_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null | cut -d'|' -f1)
+        local lock_time=$(cat "$LOCK_FILE" 2>/dev/null | cut -d'|' -f2)
+        local current_time=$(date +%s)
+
+        # Check if the process is still running
+        if [[ -n "$lock_pid" ]] && is_process_running "$lock_pid"; then
+            local age=$((current_time - lock_time))
+            if [[ $age -gt 3600 ]]; then
+                log_warn "Lock file is from a process that has been running for over an hour"
+                echo "1) Remove lock and continue"
+                echo "2) Keep lock and exit"
+                read -p "Select [1-2]: " lock_choice
+                if [[ "$lock_choice" == "1" ]]; then
+                    rm -f "$LOCK_FILE"
+                else
+                    exit 1
+                fi
+            else
+                log_error "Another instance is running (PID: $lock_pid)"
+                echo "Run 'sudo $0 clean' to force remove lock files"
+                exit 1
+            fi
+        else
+            # Stale lock file
+            log_warn "Found stale lock file from crashed process"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+
+    # Create new lock file with PID and timestamp
+    echo "$$|$(date +%s)" > "$LOCK_FILE"
+}
+
+# Setup binderfs with fstab management (ignores commented lines)
 setup_binderfs() {
     log_step "Setting up binderfs"
+
+    # Create mount point
     mkdir -p /dev/binderfs
+
+    # Mount binderfs
     if mount -t binder binder /dev/binderfs 2>/dev/null; then
         log_success "binderfs mounted successfully"
-        if ! grep -q "^binder /dev/binderfs" /etc/fstab 2>/dev/null; then
+
+        # Check if already in fstab with pattern that ignores commented lines
+        # The ^[^#]* ensures we only match non-commented lines
+        if ! grep -qE "^[^#]*binder\s+/dev/binderfs\s+binder\s+.*\s+0\s+0" /etc/fstab 2>/dev/null; then
+            # Remove any old/broken entries first (but keep comments)
+            sed -i '/^[^#]*binder.*binderfs/d' /etc/fstab 2>/dev/null
+            # Add clean entry
             echo "binder /dev/binderfs binder defaults 0 0" >> /etc/fstab
+            log_info "Added binderfs mount to /etc/fstab"
+        else
+            log_info "binderfs already in /etc/fstab"
         fi
         return 0
     fi
+
+    log_error "Failed to mount binderfs"
     return 1
 }
 
@@ -208,21 +306,45 @@ check_wayland_interactive() {
     [[ "$continue_anyway" =~ ^[Yy]$ ]]
 }
 
-# Setup firewall
+# Setup firewall with verification
 setup_firewall() {
     log_step "Configuring firewall"
+
+    local firewall_configured=0
+
     if command_exists ufw; then
+        log_info "Configuring UFW"
         ufw route allow in on waydroid0 &>/dev/null
         ufw route allow out on waydroid0 &>/dev/null
-        log_success "UFW rules updated"
+        if ufw status verbose | grep -q "waydroid0"; then
+            log_success "UFW rules configured"
+            firewall_configured=1
+        else
+            log_warn "UFW rules may need a reboot to take effect"
+        fi
     elif command_exists nft; then
+        log_info "Configuring nftables"
         nft add rule inet filter forward iifname "waydroid0" accept &>/dev/null || true
         nft add rule inet filter forward oifname "waydroid0" accept &>/dev/null || true
-        log_success "nftables rules updated"
+        if nft list ruleset | grep -q "waydroid0"; then
+            log_success "nftables rules configured"
+            firewall_configured=1
+        fi
     elif command_exists iptables; then
+        log_info "Configuring iptables"
         iptables -I FORWARD -i waydroid0 -j ACCEPT &>/dev/null || true
         iptables -I FORWARD -o waydroid0 -j ACCEPT &>/dev/null || true
-        log_success "iptables rules updated"
+        if iptables -L FORWARD -n | grep -q "waydroid0"; then
+            log_success "iptables rules configured"
+            firewall_configured=1
+        fi
+    else
+        log_warn "No supported firewall detected"
+    fi
+
+    if [[ $firewall_configured -eq 0 ]]; then
+        log_warn "Network may not work in container until reboot"
+        echo "Try rebooting after installation to ensure firewall rules take effect"
     fi
 }
 
@@ -280,8 +402,23 @@ install_binder_module() {
     if is_secure_boot_enabled; then
         log_warn "SECURE BOOT ENABLED"
         echo "This will prevent unsigned kernel modules from loading."
-        read -p "Disable Secure Boot in BIOS and try again. Continue anyway? (y/N): " sb_choice
-        [[ ! "$sb_choice" =~ ^[Yy]$ ]] && return 1
+        echo ""
+        echo "Options:"
+        echo "  1) Disable Secure Boot in BIOS and reboot (recommended)"
+        echo "  2) Continue anyway (module will not load)"
+        echo ""
+        read -p "Select [1-2]: " sb_choice
+        if [[ "$sb_choice" == "1" ]]; then
+            log_info "Please disable Secure Boot in your BIOS and reboot"
+            read -p "Press Enter after you've rebooted with Secure Boot disabled..."
+            if is_secure_boot_enabled; then
+                log_error "Secure Boot still enabled"
+                return 1
+            fi
+        else
+            log_warn "Continuing with Secure Boot enabled - binder will not work"
+            return 1
+        fi
     fi
 
     # Try to load module
@@ -327,8 +464,10 @@ install_binder_module() {
     if command -v dkms &>/dev/null; then
         local binder_version=$(dkms status binder_linux 2>/dev/null | head -1 | sed -n 's/.*binder_linux\/\([^,]*\).*/\1/p' | tr -d ' ')
         if [[ -n "$binder_version" ]]; then
+            log_info "Building binder_linux version $binder_version"
             dkms install binder_linux/"$binder_version" -k "$running_kernel" &>/dev/null
         else
+            log_info "Running DKMS autoinstall"
             dkms autoinstall -k "$running_kernel" &>/dev/null
         fi
     fi
@@ -342,6 +481,12 @@ install_binder_module() {
     fi
 
     log_error "Failed to load binder module"
+    echo ""
+    echo "===== TROUBLESHOOTING ====="
+    echo "1. A REBOOT may be required: sudo reboot"
+    echo "2. Check Secure Boot: mokutil --sb-state"
+    echo "3. Check kernel logs: dmesg | grep binder"
+    echo "============================"
     return 1
 }
 
@@ -356,39 +501,50 @@ check_binder_interactive() {
     echo ""
     echo "1) Setup binder automatically"
     echo "2) Show manual instructions"
-    echo "3) Skip"
+    echo "3) Skip (WayDroid won't work)"
+    echo ""
     read -p "Select [1-3]: " choice
 
     case $choice in
         1) install_binder_module ;;
         2)
             echo ""
-            echo "For kernels with built-in binder (Zen/CachyOS):"
-            echo "  sudo mkdir -p /dev/binderfs"
-            echo "  sudo mount -t binder binder /dev/binderfs"
-            echo "  echo 'binder /dev/binderfs binder defaults 0 0' | sudo tee -a /etc/fstab"
-            echo ""
-            echo "For standard kernels:"
-            case $(detect_distro) in
-                arch*|manjaro*)
-                    echo "  sudo pacman -S linux-$(get_kernel_flavor)-headers binder_linux-dkms"
-                    ;;
-                debian*|ubuntu*)
-                    echo "  sudo apt install linux-headers-$(uname -r) binder_linux-dkms"
-                    ;;
-                fedora*)
-                    echo "  sudo dnf install kernel-devel-$(uname -r) kernel-headers-$(uname -r) binder_linux-dkms"
-                    ;;
-                *)
-                    echo "  Install binder_linux-dkms and matching kernel headers for your distribution"
-                    ;;
-            esac
-            echo "  sudo modprobe binder_linux"
-            echo "  echo 'binder_linux' | sudo tee /etc/modules-load.d/waydroid.conf"
+            echo "===== MANUAL INSTRUCTIONS ====="
+            if grep -q "binder" /proc/filesystems; then
+                echo "Your kernel has built-in binder support:"
+                echo "  sudo mkdir -p /dev/binderfs"
+                echo "  sudo mount -t binder binder /dev/binderfs"
+                echo "  echo 'binder /dev/binderfs binder defaults 0 0' | sudo tee -a /etc/fstab"
+            else
+                echo "Your kernel needs the binder module:"
+                case $(detect_distro) in
+                    arch*|manjaro*|cachyos*)
+                        echo "  sudo pacman -S linux-$(get_kernel_flavor)-headers binder_linux-dkms"
+                        ;;
+                    debian*|ubuntu*)
+                        echo "  sudo apt install linux-headers-$(uname -r) binder_linux-dkms"
+                        ;;
+                    fedora*)
+                        echo "  sudo dnf install kernel-devel-$(uname -r) kernel-headers-$(uname -r) binder_linux-dkms"
+                        ;;
+                    opensuse*)
+                        echo "  sudo zypper install kernel-devel kernel-default-devel binder_linux-dkms"
+                        ;;
+                    *)
+                        echo "  Install binder_linux-dkms and matching kernel headers for your distribution"
+                        ;;
+                esac
+                echo "  sudo modprobe binder_linux"
+                echo "  echo 'binder_linux' | sudo tee /etc/modules-load.d/waydroid.conf"
+            fi
+            echo "================================="
             read -p "Press Enter to continue..."
             return 1
             ;;
-        *) return 1 ;;
+        *)
+            log_warn "Skipping binder setup"
+            return 1
+            ;;
     esac
 }
 
@@ -401,6 +557,7 @@ setup_waydroid_script() {
     if [[ -d "$WAYDROID_SCRIPT_DIR" ]]; then
         read -p "Update existing waydroid_script? (y/N): " update
         if [[ "$update" =~ ^[Yy]$ ]]; then
+            log_step "Updating repository"
             cd "$WAYDROID_SCRIPT_DIR" && git pull || return 1
         fi
     else
@@ -465,6 +622,12 @@ install_waydroid() {
     }
 
     log_success "WayDroid installed successfully"
+
+    # Verify firewall
+    if ! is_firewall_configured; then
+        log_warn "Firewall rules may need a reboot to take effect"
+        echo "If WayDroid has no network access, try rebooting"
+    fi
 }
 
 # Install apps menu
@@ -506,17 +669,24 @@ install_apps_menu() {
                 9) args+=("nodataperm") ;;
                 10) args+=("hidestatusbar") ;;
                 11)
-                    read -p "Enter CA certificate path: " mitm_cert
+                    read -p "Enter CA certificate path (or press Enter to skip): " mitm_cert
                     ;;
-                *) log_warn "Invalid: $num" ;;
+                *) log_warn "Invalid selection: $num" ;;
             esac
         done
 
-        if [[ -n "$mitm_cert" ]] && [[ -f "$mitm_cert" ]]; then
-            [[ ${#args[@]} -gt 0 ]] && run_python_script install "${args[@]}"
-            run_python_script install mitm --ca-cert "$mitm_cert"
-        elif [[ ${#args[@]} -gt 0 ]]; then
+        # Install selected apps
+        if [[ ${#args[@]} -gt 0 ]]; then
             run_python_script install "${args[@]}"
+        fi
+
+        # Handle MITM separately with certificate validation
+        if [[ -n "$mitm_cert" ]]; then
+            if [[ -f "$mitm_cert" ]]; then
+                run_python_script install mitm --ca-cert "$mitm_cert"
+            else
+                log_error "Certificate file not found: $mitm_cert"
+            fi
         fi
 
         read -p "Press Enter to continue..."
@@ -560,7 +730,7 @@ remove_apps_menu() {
                 9) args+=("nodataperm") ;;
                 10) args+=("hidestatusbar") ;;
                 11) args+=("mitm") ;;
-                *) log_warn "Invalid: $num" ;;
+                *) log_warn "Invalid selection: $num" ;;
             esac
         done
 
@@ -592,34 +762,29 @@ show_help() {
     echo "  sudo $0 install"
     echo "  sudo $0 install gapps microg magisk"
     echo "  sudo $0 ui"
+    echo "  sudo $0 certified"
+    echo "  sudo $0 clean"
 }
 
 # Main menu
 interactive_mode() {
     setup_logging
-
-    if [[ -f "$LOCK_FILE" ]]; then
-        local age=$(($(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0)))
-        if [[ $age -gt 3600 ]]; then
-            rm -f "$LOCK_FILE"
-        else
-            log_error "Another instance running (lock: $LOCK_FILE)"
-            echo "Run 'sudo $0 clean' to remove"
-            exit 1
-        fi
-    fi
-    touch "$LOCK_FILE"
+    acquire_lock
 
     while true; do
         clear
-        log_header "WAYDROID MANAGER v2.1.8"
+        log_header "WAYDROID MANAGER v2.2.2"
 
-        # Simple status indicators
+        # Status indicators
         local wl_status="${RED}✗${NC}"
         is_wayland_active && wl_status="${GREEN}✓${NC}"
 
         local binder_status="${RED}✗${NC}"
-        is_binder_working && binder_status="${GREEN}✓${NC}"
+        if is_binder_working; then
+            binder_status="${GREEN}✓${NC}"
+        elif is_binder_available; then
+            binder_status="${YELLOW}⚡${NC}"
+        fi
 
         local wd_status="${RED}Not Installed${NC}"
         if is_waydroid_installed; then
@@ -630,10 +795,13 @@ interactive_mode() {
             fi
         fi
 
+        local fw_status=""
+        is_firewall_configured || fw_status="${YELLOW} (FW may need reboot)${NC}"
+
         local sb_warn=""
         is_secure_boot_enabled && sb_warn="${YELLOW} (Secure Boot ON)${NC}"
 
-        echo -e "${CYAN}System:${NC} $(detect_distro) | $(uname -m) | Kernel: $(uname -r)$sb_warn"
+        echo -e "${CYAN}System:${NC} $(detect_distro) | $(uname -m) | Kernel: $(uname -r)$sb_warn$fw_status"
         echo -e "${CYAN}Status:${NC} Wayland [$wl_status] Binder [$binder_status] WayDroid [$wd_status]"
         echo -e "${CYAN}Log:${NC} $LOG_FILE"
         echo "──────────────────────────────────"
@@ -660,13 +828,27 @@ interactive_mode() {
             3)  remove_apps_menu ;;
             4)  run_python_script certified ;;
             5)
+                # Safety guard for hacks - ensure waydroid_script is set up
+                if [[ ! -f "$PYTHON_SCRIPT" ]] || [[ ! -f "$MAIN_PY" ]]; then
+                    log_warn "Helper scripts not found. Setting them up first..."
+                    setup_waydroid_script || {
+                        log_error "Failed to setup waydroid_script"
+                        read -p "Press Enter to continue..."
+                        continue
+                    }
+                fi
+
                 read -p "Enter hack (nodataperm/hidestatusbar): " hack
-                [[ -n "$hack" ]] && run_python_script hack "$hack"
+                if [[ -n "$hack" ]]; then
+                    run_python_script hack "$hack"
+                else
+                    log_warn "No hack specified"
+                fi
                 ;;
             6)
                 if check_wayland_interactive && check_binder_interactive; then
                     if [[ -n "${SUDO_USER:-}" ]]; then
-                        sudo -u "$ORIGINAL_USER" waydroid show-full-ui &
+                        sudo -u "$ORIGINAL_USER" XDG_RUNTIME_DIR="/run/user/$ORIGINAL_UID" waydroid show-full-ui &
                     else
                         waydroid show-full-ui &
                     fi
@@ -676,9 +858,9 @@ interactive_mode() {
             7)
                 if check_wayland_interactive && check_binder_interactive; then
                     if [[ -n "${SUDO_USER:-}" ]]; then
-                        sudo -u "$ORIGINAL_USER" waydroid session start &
+                        sudo -u "$ORIGINAL_USER" XDG_RUNTIME_DIR="/run/user/$ORIGINAL_UID" waydroid session start &
                         sleep 2
-                        sudo -u "$ORIGINAL_USER" waydroid show-full-ui &
+                        sudo -u "$ORIGINAL_USER" XDG_RUNTIME_DIR="/run/user/$ORIGINAL_UID" waydroid show-full-ui &
                     else
                         waydroid session start &
                         sleep 2
@@ -687,8 +869,8 @@ interactive_mode() {
                     log_success "WayDroid multi-window started"
                 fi
                 ;;
-            8)  systemctl stop waydroid-container && log_success "Stopped" ;;
-            9)  systemctl restart waydroid-container && log_success "Restarted" ;;
+            8)  systemctl stop waydroid-container && log_success "WayDroid stopped" ;;
+            9)  systemctl restart waydroid-container && log_success "WayDroid restarted" ;;
             10) check_binder_interactive ;;
             11) setup_waydroid_script ;;
             12) install_dependencies ;;
